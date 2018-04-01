@@ -4,9 +4,12 @@ using MixItUp.Base.Services;
 using MixItUp.Base.Util;
 using MixItUp.Desktop.Services;
 using MixItUp.WPF.Util;
+using mshtml;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.IO;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -19,11 +22,19 @@ namespace MixItUp.WPF.Controls.MainControls
     /// </summary>
     public partial class SongRequestControl : MainControlBase
     {
+        private const string YouTubeVideoHTMLStart = "<html><body>" +
+            "<script>var done = false; function onPlayerStateChange(event) { if (event.data == YT.PlayerState.ENDED) { done = true; } }</script>" +
+            "<iframe align=\"center\" height=155 width=275 allow=\"autoplay; encrypted-media\" allowFullScreen autoplay " +
+            "src=\"https://www.youtube.com/embed/";
+        private const string YoutubeVideoHTMLEnd = "?autoplay=1&rel=0&amp;controls=0&amp;showinfo=0&amp;\" /></body></html>";
+
         private static SemaphoreSlim songListLock = new SemaphoreSlim(1);
 
         private ObservableCollection<SongRequestItem> requests = new ObservableCollection<SongRequestItem>();
 
         private CancellationTokenSource backgroundThreadCancellationTokenSource = new CancellationTokenSource();
+
+        private string YoutubeVideoHTML;
 
         public SongRequestControl()
         {
@@ -36,22 +47,24 @@ namespace MixItUp.WPF.Controls.MainControls
 
             this.SongRequestsQueueListView.ItemsSource = this.requests;
 
-            this.SongServiceTypeComboBox.ItemsSource = EnumHelper.GetEnumNames<SongRequestServiceTypeEnum>(new List<SongRequestServiceTypeEnum>() { SongRequestServiceTypeEnum.Spotify });
+            this.SongServiceTypeComboBox.ItemsSource = EnumHelper.GetEnumNames<SongRequestServiceTypeEnum>(new List<SongRequestServiceTypeEnum>() { SongRequestServiceTypeEnum.Spotify, SongRequestServiceTypeEnum.Youtube });
 
             this.SongServiceTypeComboBox.SelectedItem = EnumHelper.GetEnumName(ChannelSession.Settings.SongRequestServiceType);
             this.SpotifyAllowExplicitSongToggleButton.IsChecked = ChannelSession.Settings.SpotifyAllowExplicit;
 
             await this.RefreshRequestsList();
 
+            this.YoutubeVideoHTML = File.ReadAllText("YouTube\\YoutubeSongRequestPage.html");
+
             await base.InitializeInternal();
         }
 
-        private async void EnableGameQueueToggleButton_Checked(object sender, System.Windows.RoutedEventArgs e)
+        private async void EnableSongRequestToggleButton_Checked(object sender, System.Windows.RoutedEventArgs e)
         {
             if (this.SongServiceTypeComboBox.SelectedIndex < 0)
             {
                 await MessageBoxHelper.ShowMessageDialog("You must select a song service type.");
-                this.EnableGameQueueToggleButton.IsChecked = false;
+                this.EnableSongRequestToggleButton.IsChecked = false;
                 return;
             }
 
@@ -65,7 +78,7 @@ namespace MixItUp.WPF.Controls.MainControls
                 if (ChannelSession.Services.Spotify == null)
                 {
                     await MessageBoxHelper.ShowMessageDialog("You must connect to your Spotify account in the Services area.");
-                    this.EnableGameQueueToggleButton.IsChecked = false;
+                    this.EnableSongRequestToggleButton.IsChecked = false;
                     return;
                 }
             }
@@ -76,7 +89,7 @@ namespace MixItUp.WPF.Controls.MainControls
                 ChannelSession.Settings.SpotifyAllowExplicit = this.SpotifyAllowExplicitSongToggleButton.IsChecked.GetValueOrDefault();
 
                 this.SongServiceTypeComboBox.IsEnabled = this.SpotifyOptionsGrid.IsEnabled = false;
-                this.CurrentlyPlayingAndSongQueueGrid.IsEnabled = true;
+                this.PlayerControlsGrid.IsEnabled = this.CurrentlyPlayingAndSongQueueGrid.IsEnabled = true;
 
                 await ChannelSession.Services.SongRequestService.Initialize(ChannelSession.Settings.SongRequestServiceType);
 
@@ -86,28 +99,31 @@ namespace MixItUp.WPF.Controls.MainControls
             });
         }
 
-        private void EnableGameQueueToggleButton_Unchecked(object sender, System.Windows.RoutedEventArgs e)
+        private void EnableSongRequestToggleButton_Unchecked(object sender, System.Windows.RoutedEventArgs e)
         {
             ChannelSession.Services.SongRequestService.Disable();
 
             this.SongServiceTypeComboBox.IsEnabled = this.SpotifyOptionsGrid.IsEnabled = true;
-            this.CurrentlyPlayingAndSongQueueGrid.IsEnabled = false;
+            this.PlayerControlsGrid.IsEnabled = this.CurrentlyPlayingAndSongQueueGrid.IsEnabled = false;
         }
 
         private void SongServiceTypeComboBox_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
         {
+            this.YoutubeOptionsGrid.Visibility = Visibility.Collapsed;
             this.SpotifyOptionsGrid.Visibility = Visibility.Collapsed;
+            this.PlayPauseButton.Visibility = Visibility.Collapsed;
 
             if (this.SongServiceTypeComboBox.SelectedIndex >= 0)
             {
                 SongRequestServiceTypeEnum service = EnumHelper.GetEnumValueFromString<SongRequestServiceTypeEnum>((string)this.SongServiceTypeComboBox.SelectedItem);
                 if (service == SongRequestServiceTypeEnum.Youtube)
                 {
-
+                    this.YoutubeOptionsGrid.Visibility = Visibility.Visible;
                 }
                 else if (service == SongRequestServiceTypeEnum.Spotify)
                 {
                     this.SpotifyOptionsGrid.Visibility = Visibility.Visible;
+                    this.PlayPauseButton.Visibility = Visibility.Visible;
                 }
             }
         }
@@ -154,6 +170,10 @@ namespace MixItUp.WPF.Controls.MainControls
                 {
                     await ChannelSession.Services.Spotify.NextCurrentlyPlaying();
                 }
+                else if (ChannelSession.Services.SongRequestService.GetRequestService() == SongRequestServiceTypeEnum.Youtube)
+                {
+                    this.SetYoutubeVideoRender("ZgsByqwaC5k");
+                }
             });
         }
 
@@ -199,6 +219,36 @@ namespace MixItUp.WPF.Controls.MainControls
             }
 
             SongRequestControl.songListLock.Release();
+        }
+
+        private void SetYoutubeVideoRender(string videoID)
+        {
+            this.YoutubeWebBrowser.NavigateToString(this.YoutubeVideoHTML.Replace("<YOUTUBE VIDEO ID>", videoID));
+
+            Task.Run(async () =>
+            {
+                bool songDone = false;
+                while (!songDone)
+                {
+                    try
+                    {
+                        await this.Dispatcher.InvokeAsync(() =>
+                        {
+                            IHTMLDocument2 document = this.YoutubeWebBrowser.Document as IHTMLDocument2;
+                            IHTMLWindow2 window = document.parentWindow as IHTMLWindow2;
+                            Type vWindowType = window.GetType();
+                            object songDoneValue = vWindowType.InvokeMember("songDone", BindingFlags.GetProperty, null, window, new object[] { });
+                            if (songDoneValue is bool)
+                            {
+                                songDone = (bool)songDoneValue;
+                            }
+                        });
+                    }
+                    catch (Exception) { }
+
+                    await Task.Delay(1000);
+                }
+            });
         }
     }
 }
